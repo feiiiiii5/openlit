@@ -416,7 +416,10 @@ def common_generate_logic(
             **extra,
         )
 
-    scope._span.set_status(Status(StatusCode.OK))
+    # A stream that failed mid-way is recorded as ERROR after this call, and the
+    # SDK ignores a later status once OK is set, so leave the status alone then.
+    if not getattr(scope, "_gen_ai_error", None):
+        scope._span.set_status(Status(StatusCode.OK))
 
     # Span status and metrics
     if not disable_metrics:
