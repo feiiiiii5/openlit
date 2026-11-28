@@ -77,6 +77,7 @@ class PipelineResult:
     action: GuardAction = GuardAction.ALLOW
     results: List[GuardResult] = field(default_factory=list)
     transformed_text: Optional[str] = None
+    unscanned_suffix: str = ""
 
     @property
     def explanation(self) -> str:

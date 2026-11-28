@@ -47,14 +47,21 @@ class Pipeline:
         guard_phase = GuardPhase(phase)
         results: List[GuardResult] = []
         current_text = text
+        unscanned_suffix = ""
         worst_action = GuardAction.ALLOW
 
         for guard in self._guards:
             if not guard.supports_phase(guard_phase):
                 continue
 
+            scan_text = current_text
+            limit = getattr(guard, "_max_scan_length", 0)
+            dropped = ""
+            if limit and len(scan_text) > limit:
+                scan_text, dropped = scan_text[:limit], scan_text[limit:]
+
             try:
-                result = guard.run(current_text, guard_phase)
+                result = guard.run(scan_text, guard_phase)
             except Exception:
                 if self._fail_open:
                     logger.warning(
@@ -78,6 +85,8 @@ class Pipeline:
                 and result.transformed_text is not None
             ):
                 current_text = result.transformed_text
+                if dropped:
+                    unscanned_suffix = dropped + unscanned_suffix
 
             if result.action == GuardAction.DENY:
                 break
@@ -87,6 +96,7 @@ class Pipeline:
             action=worst_action,
             results=results,
             transformed_text=transformed,
+            unscanned_suffix=unscanned_suffix,
         )
 
     # ------------------------------------------------------------------

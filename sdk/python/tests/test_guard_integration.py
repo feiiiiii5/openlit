@@ -1,13 +1,20 @@
 """Tests for auto-guard integration (no real LLM calls)."""
 
 import asyncio
+import re
 import sys
 import types
 
 import pytest
 
 from openlit.guard import _integration
-from openlit.guard._base import GuardDeniedError
+from openlit.guard._base import (
+    Guard,
+    GuardAction,
+    GuardDeniedError,
+    GuardPhase,
+    GuardResult,
+)
 from openlit.guard._integration import (
     GUARDED_METHODS,
     _extract_openai_input,
@@ -21,6 +28,66 @@ from openlit.guard._integration import (
 from openlit.guard._pipeline import Pipeline
 from openlit.guard.pii import PII
 from openlit.guard.prompt_injection import PromptInjection
+
+
+class _RegexRedactGuard(Guard):
+    """Test guard that redacts a regex match in postflight text."""
+
+    name = "regex-redact"
+    phases = (GuardPhase.POSTFLIGHT,)
+
+    def __init__(
+        self, pattern, replacement="[REDACTED:secret]", max_scan_length=102_400
+    ):
+        super().__init__(action="redact", max_scan_length=max_scan_length)
+        self._pattern = pattern
+        self._replacement = replacement
+
+    def evaluate(self, text):
+        if re.search(self._pattern, text):
+            return GuardResult(
+                action=GuardAction.REDACT,
+                transformed_text=re.sub(self._pattern, self._replacement, text),
+            )
+        return GuardResult()
+
+
+class _ExactDenyGuard(Guard):
+    """Test guard that denies one exact standalone block."""
+
+    name = "exact-deny"
+    phases = (GuardPhase.POSTFLIGHT,)
+
+    def __init__(self, denied_text):
+        super().__init__(action="deny")
+        self._denied_text = denied_text
+
+    def evaluate(self, text):
+        if text == self._denied_text:
+            return GuardResult(action=GuardAction.DENY)
+        return GuardResult()
+
+
+class _BlockFailureGuard(Guard):
+    """Test guard that fails only on one standalone block."""
+
+    name = "block-failure"
+    phases = (GuardPhase.POSTFLIGHT,)
+
+    def __init__(self, fail_text, secret):
+        super().__init__(action="redact")
+        self._fail_text = fail_text
+        self._secret = secret
+
+    def evaluate(self, text):
+        if text == self._fail_text:
+            raise RuntimeError("block evaluation failed")
+        if self._secret in text:
+            return GuardResult(
+                action=GuardAction.REDACT,
+                transformed_text=text.replace(self._secret, "[REDACTED]"),
+            )
+        return GuardResult()
 
 
 class TestExtractors:
@@ -224,6 +291,130 @@ class TestPostflightIntegration:
             "First: [REDACTED:email]",
             "Second: [REDACTED:email]",
         ]
+
+    def test_postflight_propagates_block_deny(self):
+        """A per-block denial is not discarded by a permissive combined result."""
+        pipeline = Pipeline(
+            guards=[PII(action="redact"), _ExactDenyGuard("denied block")],
+            fail_open=True,
+        )
+        response = types.SimpleNamespace(
+            content=[
+                types.SimpleNamespace(text="alice@example.com"),
+                types.SimpleNamespace(text="denied block"),
+            ]
+        )
+
+        with pytest.raises(GuardDeniedError):
+            _apply_postflight(pipeline, response, _extract_anthropic_output)
+
+    def test_postflight_strict_block_failure_propagates(self):
+        """Fail-closed per-block errors are not swallowed by the postflight mutation handler."""
+        pipeline = Pipeline(
+            guards=[_BlockFailureGuard("second block", "SECRET")],
+            fail_open=False,
+        )
+        response = types.SimpleNamespace(
+            content=[
+                types.SimpleNamespace(text="SECRET first"),
+                types.SimpleNamespace(text="second block"),
+            ]
+        )
+
+        with pytest.raises(RuntimeError, match="block evaluation failed"):
+            _apply_postflight(pipeline, response, _extract_anthropic_output)
+
+    def test_postflight_fail_open_block_failure_keeps_response(self):
+        """Fail-open block errors still allow the redacted response through."""
+        pipeline = Pipeline(
+            guards=[_BlockFailureGuard("second block", "SECRET")],
+            fail_open=True,
+        )
+        response = types.SimpleNamespace(
+            content=[
+                types.SimpleNamespace(text="SECRET first"),
+                types.SimpleNamespace(text="second block"),
+            ]
+        )
+
+        _apply_postflight(pipeline, response, _extract_anthropic_output)
+
+        assert "[REDACTED]" in response.content[0].text
+
+    def test_postflight_redacts_split_secret_across_blocks(self):
+        """A match spanning two blocks is redacted from the combined result."""
+        pipeline = Pipeline(
+            guards=[_RegexRedactGuard(r"alice\s+example\.com")],
+            fail_open=True,
+        )
+        response = types.SimpleNamespace(
+            content=[
+                types.SimpleNamespace(text="First: alice"),
+                types.SimpleNamespace(text="example.com"),
+            ]
+        )
+
+        _apply_postflight(pipeline, response, _extract_anthropic_output)
+
+        combined = " ".join(block.text for block in response.content)
+        assert "[REDACTED:secret]" in combined
+        assert "alice" not in combined
+        assert "example.com" not in combined
+
+    def test_postflight_preserves_unscanned_suffix(self):
+        """A prefix-only redaction leaves the block text beyond the scan limit intact."""
+        pipeline = Pipeline(
+            guards=[_RegexRedactGuard("SECRET-", "[REDACTED]", max_scan_length=20)],
+            fail_open=True,
+        )
+        response = types.SimpleNamespace(
+            content=[types.SimpleNamespace(text="SECRET-" + "A" * 100)]
+        )
+
+        _apply_postflight(pipeline, response, _extract_anthropic_output)
+
+        text = response.content[0].text
+        assert "[REDACTED]" in text
+        assert text.endswith("A" * 80)
+
+    def test_postflight_keeps_long_scan_redaction_behind_short_scan_guard(self):
+        """A shorter later guard does not reintroduce a secret redacted earlier."""
+        pipeline = Pipeline(
+            guards=[
+                _RegexRedactGuard("SECRET_A", "[REDACTED_A]", max_scan_length=200),
+                _RegexRedactGuard("B_TOKEN", "[B]", max_scan_length=20),
+            ],
+            fail_open=True,
+        )
+        response = types.SimpleNamespace(
+            content=[
+                types.SimpleNamespace(
+                    text="B_TOKEN " + "A" * 20 + " SECRET_A " + "Z" * 100
+                )
+            ]
+        )
+
+        _apply_postflight(pipeline, response, _extract_anthropic_output)
+
+        text = response.content[0].text
+        assert "[B]" in text
+        assert "[REDACTED_A]" in text
+        assert "SECRET_A" not in text
+
+    def test_postflight_keeps_empty_redaction(self):
+        """An empty transformed text is a valid REDACT result."""
+        pipeline = Pipeline(
+            guards=[_RegexRedactGuard("SECRET tail", "")],
+            fail_open=True,
+        )
+        response = types.SimpleNamespace(
+            content=[types.SimpleNamespace(text="SECRET tail")]
+        )
+
+        _apply_postflight(pipeline, response, _extract_anthropic_output)
+
+        assert response.content[0].text == ""
+        assert "SECRET" not in response.content[0].text
 
 
 class TestAsyncMethodDetection:

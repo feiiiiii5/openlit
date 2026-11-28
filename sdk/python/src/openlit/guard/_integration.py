@@ -24,6 +24,7 @@ completions. Preflight guards always run.
 
 from __future__ import annotations
 
+import difflib
 import importlib
 import inspect
 import logging
@@ -329,35 +330,71 @@ def _apply_preflight(
     return kwargs, result
 
 
-def _redact_anthropic_content_blocks(
+def _full_transformed_text(original: str, result: PipelineResult) -> str:
+    transformed = (
+        result.transformed_text if result.transformed_text is not None else original
+    )
+    return transformed + result.unscanned_suffix
+
+
+def _block_index_at(spans: List[Tuple[int, int]], position: int) -> int:
+    for index, (_start, end) in enumerate(spans):
+        if position <= end:
+            return index
+    return len(spans) - 1
+
+
+def _distribute_combined_text(texts: List[str], transformed: str) -> List[str]:
+    if len(texts) == 1:
+        return [transformed]
+    joined = " ".join(texts)
+    spans: List[Tuple[int, int]] = []
+    offset = 0
+    for text in texts:
+        spans.append((offset, offset + len(text)))
+        offset += len(text) + 1
+
+    parts = ["" for _ in texts]
+    matcher = difflib.SequenceMatcher(None, joined, transformed, autojunk=False)
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "delete":
+            continue
+        if tag == "equal":
+            for position in range(i1, i2):
+                parts[_block_index_at(spans, position)] += transformed[
+                    j1 + position - i1
+                ]
+        else:
+            parts[_block_index_at(spans, i1)] += transformed[j1:j2]
+    return [part.rstrip(" ") for part in parts]
+
+
+def _prepare_anthropic_content_redactions(
     pipeline: Pipeline,
     content: List[Any],
-    combined_text: str,
-) -> None:
-    """Redact each Anthropic text block independently, in place.
+    result: PipelineResult,
+) -> List[Tuple[Any, str, str]]:
+    text_blocks = [
+        (block, block.text)
+        for block in content
+        if isinstance(getattr(block, "text", None), str) and block.text
+    ]
+    if not text_blocks:
+        return []
 
-    The extractor joins every text block into one string, so the pipeline's
-    transformed text describes the whole response. Writing that combined
-    string into a single block would duplicate the other blocks and leave their
-    secrets untouched. Re-evaluate each block's own text and write each redacted
-    result back to the block it came from. A single block keeps the original
-    combined result verbatim, avoiding a redundant pipeline run.
-    """
-    if len(content) == 1:
-        block = content[0]
-        if hasattr(block, "text"):
-            block.text = combined_text
-        return
+    for _block, text in text_blocks:
+        block_result = pipeline.evaluate(text, phase="postflight")
+        if block_result.action == GuardAction.DENY:
+            raise GuardDeniedError(block_result)
 
-    for block in content:
-        if not getattr(block, "text", None):
-            continue
-        block_result = pipeline.evaluate(block.text, phase="postflight")
-        if (
-            block_result.action == GuardAction.REDACT
-            and block_result.transformed_text is not None
-        ):
-            block.text = block_result.transformed_text
+    original = " ".join(text for _block, text in text_blocks)
+    transformed = _full_transformed_text(original, result)
+    redacted = _distribute_combined_text(
+        [text for _block, text in text_blocks], transformed
+    )
+    return [
+        (block, "text", text) for (block, _text), text in zip(text_blocks, redacted)
+    ]
 
 
 def _apply_postflight(
@@ -375,24 +412,34 @@ def _apply_postflight(
     if result.action == GuardAction.DENY:
         raise GuardDeniedError(result)
 
-    if result.action == GuardAction.REDACT and result.transformed_text is not None:
-        try:
-            choices = getattr(response, "choices", None)
-            if choices:
-                for choice in choices:
-                    msg = getattr(choice, "message", None)
-                    if msg and hasattr(msg, "content"):
-                        msg.content = result.transformed_text
-            else:
-                content = getattr(response, "content", None)
-                if isinstance(content, list) and content:
-                    _redact_anthropic_content_blocks(
-                        pipeline, content, result.transformed_text
-                    )
-                elif hasattr(response, "text"):
-                    response.text = result.transformed_text
-        except Exception:
-            pass
+    if result.action != GuardAction.REDACT or result.transformed_text is None:
+        return response
+
+    redactions: List[Tuple[Any, str, str]] = []
+    choices = getattr(response, "choices", None)
+    if choices:
+        for choice in choices:
+            msg = getattr(choice, "message", None)
+            if msg and hasattr(msg, "content"):
+                redactions.append(
+                    (msg, "content", _full_transformed_text(output_text, result))
+                )
+    else:
+        content = getattr(response, "content", None)
+        if isinstance(content, list) and content:
+            redactions = _prepare_anthropic_content_redactions(
+                pipeline, content, result
+            )
+        elif hasattr(response, "text"):
+            redactions.append(
+                (response, "text", _full_transformed_text(output_text, result))
+            )
+
+    try:
+        for target, attribute, text in redactions:
+            setattr(target, attribute, text)
+    except Exception:
+        logger.warning("Postflight redaction could not be applied", exc_info=True)
 
     return response
 
