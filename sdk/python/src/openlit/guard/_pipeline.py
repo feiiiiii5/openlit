@@ -42,6 +42,11 @@ class Pipeline:
         """Return a shallow copy of the configured guards in pipeline order."""
         return list(self._guards)
 
+    @property
+    def fail_open(self) -> bool:
+        """Whether guard failures are treated as allow."""
+        return self._fail_open
+
     def evaluate(self, text: str, phase: str = "preflight") -> PipelineResult:
         """Run every guard that supports ``phase`` and aggregate the results."""
         guard_phase = GuardPhase(phase)

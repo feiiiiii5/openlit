@@ -36,8 +36,10 @@ from openlit.guard._base import (
     GuardAction,
     GuardDeniedError,
     PipelineResult,
+    _ACTION_SEVERITY,
 )
 from openlit.guard._pipeline import Pipeline
+from openlit.guard.prompt_injection import PromptInjection
 
 logger = logging.getLogger(__name__)
 
@@ -297,7 +299,13 @@ GUARDED_METHODS: List[Tuple[str, str, Extractor, Extractor]] = [
 # ---------------------------------------------------------------------------
 
 
-def _iter_text_paths(kwargs: Dict[str, Any]):
+def _text_key_order(extract_input: Extractor) -> Tuple[str, ...]:
+    if extract_input is _extract_openai_input:
+        return ("messages", "input", "message", "prompt", "text")
+    return ("messages", "message", "prompt", "input", "text")
+
+
+def _iter_text_paths(kwargs: Dict[str, Any], keys: Tuple[str, ...]):
     """Yield a path for every independent text field in ``kwargs``.
 
     A path is a tuple of dict keys and list indexes locating a string the
@@ -306,13 +314,13 @@ def _iter_text_paths(kwargs: Dict[str, Any]):
     ``messages`` list therefore yields one path per turn instead of a single
     concatenated blob that can only be written back to the last message.
     """
-    for key in ("messages", "input", "message", "prompt", "text"):
+    for key in keys:
         value = kwargs.get(key)
         if not value:
             continue
         if isinstance(value, str):
             yield (key,)
-        elif isinstance(value, list):
+        elif isinstance(value, (list, tuple)):
             for index, item in enumerate(value):
                 if isinstance(item, str):
                     yield (key, index)
@@ -326,6 +334,8 @@ def _iter_text_paths(kwargs: Dict[str, Any]):
                                 block.get("text"), str
                             ):
                                 yield (key, index, "content", block_index, "text")
+                elif isinstance(item, tuple) and len(item) > 1 and isinstance(item[1], str):
+                    yield (key, index, 1)
         return
 
 
@@ -335,30 +345,64 @@ def _read_text_at_path(kwargs: Dict[str, Any], path: Tuple) -> Optional[str]:
     for step in path:
         if isinstance(value, dict):
             value = value.get(step)
-        elif isinstance(value, list) and isinstance(step, int) and 0 <= step < len(value):
+        elif isinstance(value, (list, tuple)) and isinstance(step, int) and 0 <= step < len(value):
             value = value[step]
         else:
             return None
     return value if isinstance(value, str) else None
 
 
+def _replace_text_at_path(container: Any, path: Tuple, text: str) -> Any:
+    step = path[0]
+    if isinstance(container, dict):
+        if step not in container:
+            return container
+        if len(path) == 1:
+            return {**container, step: text}
+        return {**container, step: _replace_text_at_path(container[step], path[1:], text)}
+    if isinstance(container, (list, tuple)):
+        if not isinstance(step, int) or not 0 <= step < len(container):
+            return container
+        replacement = (
+            text
+            if len(path) == 1
+            else _replace_text_at_path(container[step], path[1:], text)
+        )
+        if isinstance(container, tuple):
+            return tuple(
+                replacement if index == step else item
+                for index, item in enumerate(container)
+            )
+        copied = list(container)
+        copied[step] = replacement
+        return copied
+    return container
+
+
 def _write_text_at_path(
     kwargs: Dict[str, Any], path: Tuple, text: str
 ) -> Dict[str, Any]:
     """Return a copy of ``kwargs`` with the string at ``path`` replaced."""
-    result: Dict[str, Any] = {**kwargs}
-    container: Any = result
-    for step in path[:-1]:
-        child = container[step]
-        if isinstance(child, dict):
-            container[step] = {**child}
-        elif isinstance(child, list):
-            container[step] = list(child)
-        else:
-            return result
-        container = container[step]
-    container[path[-1]] = text
-    return result
+    return _replace_text_at_path(kwargs, path, text)
+
+
+def _merge_results(
+    first: Optional[PipelineResult], second: Optional[PipelineResult]
+) -> Optional[PipelineResult]:
+    if first is None:
+        return second
+    if second is None:
+        return first
+    action = (
+        first.action
+        if _ACTION_SEVERITY[first.action] >= _ACTION_SEVERITY[second.action]
+        else second.action
+    )
+    return PipelineResult(
+        action=action,
+        results=[*first.results, *second.results],
+        transformed_text=second.transformed_text or first.transformed_text,
+    )
 
 
 def _apply_preflight(
@@ -368,7 +412,7 @@ def _apply_preflight(
 ) -> Tuple[Dict[str, Any], Optional[PipelineResult]]:
     """Run preflight guards on every text field. Returns (kwargs, result_or_None)."""
     slots = []
-    for path in _iter_text_paths(kwargs):
+    for path in _iter_text_paths(kwargs, _text_key_order(extract_input)):
         text = _read_text_at_path(kwargs, path)
         if text:
             slots.append((path, text))
@@ -384,22 +428,35 @@ def _apply_preflight(
             raise GuardDeniedError(result)
         return kwargs, result
 
+    combined_text = "\n".join(text for _, text in slots)
+    context_guards = [guard for guard in pipeline.guards if isinstance(guard, PromptInjection)]
+    slot_guards = [guard for guard in pipeline.guards if not isinstance(guard, PromptInjection)]
+    combined_result: Optional[PipelineResult] = None
+    if combined_text and context_guards:
+        combined_result = Pipeline(
+            context_guards, fail_open=pipeline.fail_open
+        ).evaluate(combined_text, phase="preflight")
+        if combined_result.action == GuardAction.DENY:
+            raise GuardDeniedError(combined_result)
+
+    slot_pipeline = Pipeline(slot_guards, fail_open=pipeline.fail_open) if slot_guards else None
     updated_kwargs = kwargs
-    last_result: Optional[PipelineResult] = None
-    for path, text in slots:
-        result = pipeline.evaluate(text, phase="preflight")
+    slot_result: Optional[PipelineResult] = None
+    if slot_pipeline is not None:
+        for path, text in slots:
+            result = slot_pipeline.evaluate(text, phase="preflight")
 
-        if result.action == GuardAction.DENY:
-            raise GuardDeniedError(result)
+            if result.action == GuardAction.DENY:
+                raise GuardDeniedError(result)
 
-        if result.action == GuardAction.REDACT and result.transformed_text is not None:
-            updated_kwargs = _write_text_at_path(
-                updated_kwargs, path, result.transformed_text
-            )
+            if result.action == GuardAction.REDACT and result.transformed_text is not None:
+                updated_kwargs = _write_text_at_path(
+                    updated_kwargs, path, result.transformed_text
+                )
 
-        last_result = result
+            slot_result = _merge_results(slot_result, result)
 
-    return updated_kwargs, last_result
+    return updated_kwargs, _merge_results(combined_result, slot_result)
 
 
 def _apply_postflight(
