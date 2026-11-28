@@ -18,6 +18,8 @@ from openlit.guard.schema import Schema
 
 
 class RecordingGuard(Guard):
+    """Records each evaluated string so tests can inspect downstream input."""
+
     name = "recorder"
     phases = (GuardPhase.PREFLIGHT,)
 
