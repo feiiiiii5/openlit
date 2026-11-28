@@ -42,9 +42,11 @@ def format_content(messages):
 
         if isinstance(content, list):
             content_str = ", ".join(
-                f"{item['type']}: {item['text'] if 'text' in item else item.get('image_url', '')}"
-                if "type" in item
-                else f"text: {item.get('text', '')}"
+                (
+                    f"{item['type']}: {item['text'] if 'text' in item else item.get('image_url', '')}"
+                    if "type" in item
+                    else f"text: {item.get('text', '')}"
+                )
                 for item in content
             )
             formatted_messages.append(f"{role}: {content_str}")
@@ -216,16 +218,20 @@ def _set_span_messages_as_array(span, input_messages, output_messages):
         if input_messages is not None:
             span.set_attribute(
                 SemanticConvention.GEN_AI_INPUT_MESSAGES,
-                json.dumps(input_messages)
-                if isinstance(input_messages, list)
-                else input_messages,
+                (
+                    json.dumps(input_messages)
+                    if isinstance(input_messages, list)
+                    else input_messages
+                ),
             )
         if output_messages is not None:
             span.set_attribute(
                 SemanticConvention.GEN_AI_OUTPUT_MESSAGES,
-                json.dumps(output_messages)
-                if isinstance(output_messages, list)
-                else output_messages,
+                (
+                    json.dumps(output_messages)
+                    if isinstance(output_messages, list)
+                    else output_messages
+                ),
             )
     except Exception as e:
         logger.warning("Failed to set span message attributes: %s", e, exc_info=True)
@@ -444,8 +450,11 @@ def process_chunk(scope, chunk):
                     )
 
     # Handle token usage including reasoning tokens and cached tokens
-    if chunked.get("usage"):
-        usage = chunked.get("usage") or {}
+    if "usage" in chunked and chunked["usage"] is None:
+        scope._usage_tokens_unavailable = True
+    elif chunked.get("usage"):
+        usage = chunked["usage"]
+        scope._usage_tokens_unavailable = False
         scope._input_tokens = usage.get("prompt_tokens", 0)
         scope._output_tokens = usage.get("completion_tokens", 0)
         scope._cache_read_input_tokens = (usage.get("prompt_tokens_details") or {}).get(
@@ -480,7 +489,11 @@ def common_chat_logic(
     prompt = format_content(scope._kwargs.get("messages", []))
     request_model = scope._kwargs.get("model", "gpt-4o")
 
-    if (
+    tokens_unavailable = getattr(scope, "_usage_tokens_unavailable", False)
+    if tokens_unavailable:
+        input_tokens = None
+        output_tokens = None
+    elif (
         hasattr(scope, "_input_tokens")
         and scope._input_tokens is not None
         and hasattr(scope, "_output_tokens")
@@ -492,16 +505,18 @@ def common_chat_logic(
         input_tokens = general_tokens(prompt)
         output_tokens = general_tokens(scope._llmresponse)
 
-    # Azure AI Inference prompt_tokens are inclusive of cached tokens.
-    cost = get_chat_model_cost(
-        request_model,
-        pricing_info,
-        input_tokens,
-        output_tokens,
-        cache_read_tokens=getattr(scope, "_cache_read_input_tokens", 0) or 0,
-        cache_creation_tokens=getattr(scope, "_cache_creation_input_tokens", 0) or 0,
-        prompt_tokens_include_cache=True,
-    )
+    cost = None
+    if not tokens_unavailable:
+        cost = get_chat_model_cost(
+            request_model,
+            pricing_info,
+            input_tokens,
+            output_tokens,
+            cache_read_tokens=getattr(scope, "_cache_read_input_tokens", 0) or 0,
+            cache_creation_tokens=getattr(scope, "_cache_creation_input_tokens", 0)
+            or 0,
+            prompt_tokens_include_cache=True,
+        )
 
     # Common Span Attributes
     common_span_attributes(
@@ -597,39 +612,39 @@ def common_chat_logic(
             SemanticConvention.GEN_AI_TOOL_ARGS, ", ".join(filter(None, args))
         )
 
-    # Span Attributes for Cost and Tokens
-    scope._span.set_attribute(
-        SemanticConvention.GEN_AI_USAGE_INPUT_TOKENS, input_tokens
-    )
-    scope._span.set_attribute(
-        SemanticConvention.GEN_AI_USAGE_OUTPUT_TOKENS, output_tokens
-    )
-    scope._span.set_attribute(
-        SemanticConvention.GEN_AI_CLIENT_TOKEN_USAGE,
-        input_tokens + output_tokens,
-    )
-    scope._span.set_attribute(SemanticConvention.GEN_AI_USAGE_COST, cost)
-
-    # Reasoning tokens (OTel: gen_ai.usage.reasoning.output_tokens is a subset
-    # of gen_ai.usage.output_tokens above, so it is recorded separately and
-    # never added on top of the output total / gen_ai.client.token.usage).
-    # Missing details surface as unknown (marker false), never as a guessed 0.
-    if hasattr(scope, "_reasoning_tokens"):
-        set_reasoning_subset_attributes(
-            scope._span, output_tokens, scope._reasoning_tokens
-        )
-
-    # OTel cached token attributes (set even when 0)
-    if hasattr(scope, "_cache_read_input_tokens"):
+    if not tokens_unavailable:
         scope._span.set_attribute(
-            SemanticConvention.GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS,
-            scope._cache_read_input_tokens,
+            SemanticConvention.GEN_AI_USAGE_INPUT_TOKENS, input_tokens
         )
-    if hasattr(scope, "_cache_creation_input_tokens"):
         scope._span.set_attribute(
-            SemanticConvention.GEN_AI_USAGE_CACHE_CREATION_INPUT_TOKENS,
-            scope._cache_creation_input_tokens,
+            SemanticConvention.GEN_AI_USAGE_OUTPUT_TOKENS, output_tokens
         )
+        scope._span.set_attribute(
+            SemanticConvention.GEN_AI_CLIENT_TOKEN_USAGE,
+            input_tokens + output_tokens,
+        )
+        scope._span.set_attribute(SemanticConvention.GEN_AI_USAGE_COST, cost)
+
+        # Reasoning tokens (OTel: gen_ai.usage.reasoning.output_tokens is a subset
+        # of gen_ai.usage.output_tokens above, so it is recorded separately and
+        # never added on top of the output total / gen_ai.client.token.usage).
+        # Missing details surface as unknown (marker false), never as a guessed 0.
+        if hasattr(scope, "_reasoning_tokens"):
+            set_reasoning_subset_attributes(
+                scope._span, output_tokens, scope._reasoning_tokens
+            )
+
+        # OTel cached token attributes (set even when 0)
+        if hasattr(scope, "_cache_read_input_tokens"):
+            scope._span.set_attribute(
+                SemanticConvention.GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS,
+                scope._cache_read_input_tokens,
+            )
+        if hasattr(scope, "_cache_creation_input_tokens"):
+            scope._span.set_attribute(
+                SemanticConvention.GEN_AI_USAGE_CACHE_CREATION_INPUT_TOKENS,
+                scope._cache_creation_input_tokens,
+            )
 
     # Compute system instructions + tool definitions unconditionally so the
     # agent version hash is stable across content-capture toggles.
@@ -685,9 +700,9 @@ def common_chat_logic(
                 ),
                 "response_id": scope._response_id,
                 "finish_reasons": [scope._finish_reason],
-                "output_type": "text"
-                if isinstance(scope._llmresponse, str)
-                else "json",
+                "output_type": (
+                    "text" if isinstance(scope._llmresponse, str) else "json"
+                ),
                 "temperature": scope._kwargs.get("temperature"),
                 "max_tokens": scope._kwargs.get("max_tokens"),
                 "top_p": scope._kwargs.get("top_p"),
@@ -775,6 +790,13 @@ def process_streaming_chat_response(
     Process streaming chat request and generate Telemetry
     """
 
+    if (
+        getattr(scope, "_stream_error", None) is None
+        and not hasattr(scope, "_input_tokens")
+        and not getattr(scope, "_usage_tokens_unavailable", False)
+    ):
+        scope._usage_tokens_unavailable = True
+
     common_chat_logic(
         scope,
         pricing_info,
@@ -831,9 +853,15 @@ def process_chat_response(
         scope._reasoning_content = reasoning_content
 
     # Handle token usage including reasoning tokens and cached tokens
-    usage = response_dict.get("usage") or {}
-    scope._input_tokens = usage.get("prompt_tokens", 0)
-    scope._output_tokens = usage.get("completion_tokens", 0)
+    usage = response_dict.get("usage")
+    if usage is None:
+        scope._usage_tokens_unavailable = True
+        scope._input_tokens = None
+        scope._output_tokens = None
+        usage = {}
+    else:
+        scope._input_tokens = usage.get("prompt_tokens", 0)
+        scope._output_tokens = usage.get("completion_tokens", 0)
     scope._cache_read_input_tokens = (usage.get("prompt_tokens_details") or {}).get(
         "cached_tokens", 0
     ) or 0
@@ -893,7 +921,10 @@ def common_embedding_logic(
 
     request_model = scope._kwargs.get("model", "text-embedding-3-small")
 
-    cost = get_embed_model_cost(request_model, pricing_info, scope._input_tokens)
+    tokens_unavailable = getattr(scope, "_usage_tokens_unavailable", False)
+    cost = None
+    if not tokens_unavailable:
+        cost = get_embed_model_cost(request_model, pricing_info, scope._input_tokens)
 
     # Common Span Attributes
     common_span_attributes(
@@ -922,13 +953,14 @@ def common_embedding_logic(
     )
 
     # Span Attributes for Cost and Tokens
-    scope._span.set_attribute(
-        SemanticConvention.GEN_AI_USAGE_INPUT_TOKENS, scope._input_tokens
-    )
-    scope._span.set_attribute(
-        SemanticConvention.GEN_AI_CLIENT_TOKEN_USAGE, scope._input_tokens
-    )
-    scope._span.set_attribute(SemanticConvention.GEN_AI_USAGE_COST, cost)
+    if not tokens_unavailable:
+        scope._span.set_attribute(
+            SemanticConvention.GEN_AI_USAGE_INPUT_TOKENS, scope._input_tokens
+        )
+        scope._span.set_attribute(
+            SemanticConvention.GEN_AI_CLIENT_TOKEN_USAGE, scope._input_tokens
+        )
+        scope._span.set_attribute(SemanticConvention.GEN_AI_USAGE_COST, cost)
 
     # Span Attributes for Content
     if capture_message_content:
@@ -1019,7 +1051,12 @@ def process_embedding_response(
     scope._start_time = start_time
     scope._end_time = time.time()
     scope._span = span
-    scope._input_tokens = (response_dict.get("usage") or {}).get("prompt_tokens", 0)
+    usage = response_dict.get("usage")
+    if usage is None:
+        scope._usage_tokens_unavailable = True
+        scope._input_tokens = None
+    else:
+        scope._input_tokens = usage.get("prompt_tokens", 0)
     scope._response_model = response_dict.get("model")
     scope._server_address, scope._server_port = server_address, server_port
     scope._kwargs = kwargs

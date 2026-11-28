@@ -5,9 +5,9 @@ An explicit JSON null is not the same as a missing key: ``get("usage", {})``
 returns ``None`` when the key is present with a null value, so the following
 ``.get("prompt_tokens", 0)`` raises ``AttributeError``. The wrapper caught that
 error, marked the span ERROR and lost every response attribute. Null usage means
-the provider did not report tokens, so it must be treated as an empty mapping:
-token counts stay at their zero default while model, id and finish reason are
-recorded as usual.
+the provider did not report tokens, so the span stays OK, model/id/finish-reason
+attributes are retained, and token, usage and cost attributes are unset instead
+of reporting guessed zeros.
 """
 
 import time
@@ -89,6 +89,15 @@ def _assert_chat_telemetry(span):
     assert attrs[SemanticConvention.GEN_AI_RESPONSE_ID] == "chatcmpl-null-usage"
     assert attrs[SemanticConvention.GEN_AI_RESPONSE_MODEL] == "gpt-4o"
     assert tuple(attrs[SemanticConvention.GEN_AI_RESPONSE_FINISH_REASON]) == ("stop",)
+    for unset in (
+        SemanticConvention.GEN_AI_USAGE_INPUT_TOKENS,
+        SemanticConvention.GEN_AI_USAGE_OUTPUT_TOKENS,
+        SemanticConvention.GEN_AI_CLIENT_TOKEN_USAGE,
+        SemanticConvention.GEN_AI_USAGE_COST,
+        SemanticConvention.GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS,
+        SemanticConvention.GEN_AI_USAGE_CACHE_CREATION_INPUT_TOKENS,
+    ):
+        assert unset not in attrs
 
 
 def _assert_embed_telemetry(span):
@@ -96,6 +105,12 @@ def _assert_embed_telemetry(span):
     attrs = span.attributes
     assert SemanticConvention.ERROR_TYPE not in attrs
     assert attrs[SemanticConvention.GEN_AI_RESPONSE_MODEL] == "text-embedding-3-small"
+    for unset in (
+        SemanticConvention.GEN_AI_USAGE_INPUT_TOKENS,
+        SemanticConvention.GEN_AI_CLIENT_TOKEN_USAGE,
+        SemanticConvention.GEN_AI_USAGE_COST,
+    ):
+        assert unset not in attrs
 
 
 def test_chat_response_with_null_usage_keeps_ok_span_and_metadata():
@@ -195,7 +210,7 @@ def test_embed_wrapper_with_null_usage_keeps_ok_span_and_metadata():
 
 
 def test_streaming_chat_with_null_usage_chunk_keeps_ok_span_and_metadata():
-    """A streaming update with ``usage: null`` is ignored, not instrumented."""
+    """A streaming update with ``usage: null`` leaves token and cost unset."""
 
     class NullUsageStream:
         """Minimal context-manager stream yielding scripted chunks."""
@@ -257,3 +272,77 @@ def test_streaming_chat_with_null_usage_chunk_keeps_ok_span_and_metadata():
     spans = exporter.get_finished_spans()
     assert len(spans) == 1
     _assert_chat_telemetry(spans[0])
+
+
+def test_streaming_chat_with_null_then_real_usage_publishes_tokens():
+    """A later real usage mapping replaces an earlier null-usage marker."""
+
+    class ScriptedStream:
+        """Minimal context-manager stream yielding scripted chunks."""
+
+        def __init__(self, chunks):
+            self._it = iter(chunks)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            return next(self._it)
+
+    chunks = [
+        {
+            "id": "chatcmpl-mixed-usage",
+            "model": "gpt-4o",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"content": "The answer is 42."},
+                    "finish_reason": None,
+                }
+            ],
+            "usage": None,
+        },
+        {
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 8, "completion_tokens": 5},
+        },
+    ]
+    tracer, exporter = _tracer_and_exporter()
+    wrapper = sync_mod.complete(
+        version="test-version",
+        environment="test-env",
+        application_name="test-app",
+        tracer=tracer,
+        pricing_info={},
+        capture_message_content=False,
+        metrics=_metrics_dict(),
+        disable_metrics=False,
+        event_provider=None,
+    )
+    stream = wrapper(
+        lambda *_args, **_kwargs: ScriptedStream(chunks),
+        None,
+        (),
+        {**CHAT_REQUEST, "stream": True},
+    )
+    with stream as open_stream:
+        for _ in open_stream:
+            pass
+
+    spans = exporter.get_finished_spans()
+    assert len(spans) == 1
+    span = spans[0]
+    assert span.status.status_code == StatusCode.OK
+    attrs = span.attributes
+    assert SemanticConvention.ERROR_TYPE not in attrs
+    assert attrs[SemanticConvention.GEN_AI_RESPONSE_ID] == "chatcmpl-mixed-usage"
+    assert attrs[SemanticConvention.GEN_AI_USAGE_INPUT_TOKENS] == 8
+    assert attrs[SemanticConvention.GEN_AI_USAGE_OUTPUT_TOKENS] == 5
+    assert attrs[SemanticConvention.GEN_AI_CLIENT_TOKEN_USAGE] == 13
+    assert SemanticConvention.GEN_AI_USAGE_COST in attrs

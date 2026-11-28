@@ -1111,7 +1111,7 @@ def record_completion_metrics(
         )
 
     # Cost (OpenLIT vendor extension; not in OTel GenAI semconv)
-    if "genai_cost" in metrics:
+    if "genai_cost" in metrics and cost is not None:
         metrics["genai_cost"].record(cost, base_attributes)
 
 
@@ -1300,7 +1300,7 @@ def record_embedding_metrics(
     )
 
     # Cost (OpenLIT vendor extension; not in OTel GenAI semconv)
-    if "genai_cost" in metrics:
+    if "genai_cost" in metrics and cost is not None:
         metrics["genai_cost"].record(cost, base_attributes)
 
 
