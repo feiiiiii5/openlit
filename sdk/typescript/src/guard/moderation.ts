@@ -19,6 +19,45 @@ const TOXICITY_PATTERNS: RegExp[] = [
   /\b(?:i(?:'ll| will)\s+(?:kill|hurt|destroy)\s+you)\b/i,
 ];
 
+const TOXICITY_REDACTION_SOURCE = TOXICITY_PATTERNS.map(
+  (pattern) => `(?:${pattern.source})`,
+).join('|');
+
+interface RedactionSpan {
+  start: number;
+  end: number;
+  replacement: string;
+}
+
+function redactModeration(text: string, profanityRe: RegExp): string {
+  const spans: RedactionSpan[] = [];
+  const toxicityRe = new RegExp(TOXICITY_REDACTION_SOURCE, 'gi');
+  for (const match of text.matchAll(toxicityRe)) {
+    const start = match.index ?? 0;
+    spans.push({ start, end: start + match[0].length, replacement: '[REDACTED:toxicity]' });
+  }
+
+  const toxicSpans = spans.map(({ start, end }) => ({ start, end }));
+  const customRe = new RegExp(profanityRe.source, 'gi');
+  for (const match of text.matchAll(customRe)) {
+    const start = match.index ?? 0;
+    const end = start + match[0].length;
+    const overlapsToxicity = toxicSpans.some((span) => start < span.end && end > span.start);
+    if (!overlapsToxicity) {
+      spans.push({ start, end, replacement: '[REDACTED:profanity]' });
+    }
+  }
+
+  spans.sort((a, b) => a.start - b.start);
+  let transformed = '';
+  let cursor = 0;
+  for (const span of spans) {
+    transformed += text.slice(cursor, span.start) + span.replacement;
+    cursor = span.end;
+  }
+  return transformed + text.slice(cursor);
+}
+
 function buildProfanityPattern(words: string[]): RegExp {
   const escaped = words.map((w) => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
   return new RegExp('\\b(?:' + escaped.join('|') + ')\\b', 'gi');
@@ -40,6 +79,14 @@ export class Moderation extends Guard {
     this._profanityRe = buildProfanityPattern(allWords);
   }
 
+  run(text: string, phase: GuardPhase): GuardResult {
+    const result = super.run(text, phase);
+    if (result.transformedText === null || !this._maxScanLength) return result;
+    const suffix = text.slice(this._maxScanLength);
+    if (!suffix) return result;
+    return { ...result, transformedText: result.transformedText + suffix };
+  }
+
   evaluate(text: string): GuardResult {
     const profanityMatches = text.match(this._profanityRe);
     const toxicityHits = TOXICITY_PATTERNS.some((pat) => pat.test(text));
@@ -57,7 +104,7 @@ export class Moderation extends Guard {
 
     let transformedText: string | null = null;
     if (this._action === 'redact') {
-      transformedText = text.replace(this._profanityRe, '[REDACTED:profanity]');
+      transformedText = redactModeration(text, this._profanityRe);
     }
 
     return makeGuardResult({

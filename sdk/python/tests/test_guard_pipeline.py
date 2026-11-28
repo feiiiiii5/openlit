@@ -1,17 +1,33 @@
 """Tests for the Pipeline guard engine."""
 
+from typing import List
+
 import pytest
 
 from openlit.guard._base import (
     Guard,
     GuardAction,
     GuardPhase,
+    GuardResult,
 )
 from openlit.guard._pipeline import Pipeline
 from openlit.guard.pii import PII
 from openlit.guard.prompt_injection import PromptInjection
 from openlit.guard.moderation import Moderation
 from openlit.guard.schema import Schema
+
+
+class RecordingGuard(Guard):
+    name = "recorder"
+    phases = (GuardPhase.PREFLIGHT,)
+
+    def __init__(self, seen: List[str]) -> None:
+        super().__init__(action="allow")
+        self._seen = seen
+
+    def evaluate(self, text: str) -> GuardResult:
+        self._seen.append(text)
+        return GuardResult(guard_name=self.name)
 
 
 class TestPipelineBasics:
@@ -222,3 +238,29 @@ class TestModerationRedaction:
         assert result.transformed_text is not None
         assert "[REDACTED:toxicity]" in result.transformed_text
         assert "kill yourself" not in result.transformed_text.lower()
+
+    def test_overlapping_custom_word_does_not_break_toxicity_redaction(self):
+        """A custom word inside a toxic phrase cannot expose the rest of it."""
+        result = Moderation(action="redact", custom_words=["I'll"]).evaluate("I'll kill you")
+
+        assert result.classification == "profanity, toxicity"
+        assert result.transformed_text == "[REDACTED:toxicity]"
+        assert "kill you" not in result.transformed_text
+
+    def test_long_input_keeps_unscanned_suffix(self):
+        """A capped scan does not truncate the text returned to callers."""
+        text = "kill yourself and more text"
+        result = Moderation(action="redact", max_scan_length=20).run(text, GuardPhase.PREFLIGHT)
+
+        assert result.transformed_text == "[REDACTED:toxicity] and more text"
+
+    def test_later_guard_receives_redacted_toxicity(self):
+        """Downstream guards see the placeholder instead of the original phrase."""
+        seen: List[str] = []
+        pipeline = Pipeline(
+            guards=[Moderation(action="redact"), RecordingGuard(seen)],
+            fail_open=False,
+        )
+        pipeline.evaluate("kill yourself", phase="preflight")
+
+        assert seen == ["[REDACTED:toxicity]"]

@@ -7,7 +7,8 @@ Uses local keyword/regex patterns.  Phases: preflight + postflight.
 from __future__ import annotations
 
 import re
-from typing import List, Optional
+from dataclasses import replace
+from typing import List, Optional, Tuple
 
 from openlit.guard._base import Guard, GuardPhase, GuardResult
 
@@ -55,6 +56,29 @@ def _build_profanity_pattern(words: List[str]) -> re.Pattern:
     return re.compile(r"\b(?:" + "|".join(escaped) + r")\b", re.IGNORECASE)
 
 
+def _redact_spans(text: str, profanity_re: re.Pattern) -> str:
+    spans: List[Tuple[int, int, str]] = []
+    for match in _TOXICITY_RE.finditer(text):
+        spans.append((match.start(), match.end(), "[REDACTED:toxicity]"))
+
+    toxic_spans = [(start, end) for start, end, _ in spans]
+    for match in profanity_re.finditer(text):
+        start, end = match.span()
+        if any(start < toxic_end and end > toxic_start for toxic_start, toxic_end in toxic_spans):
+            continue
+        spans.append((start, end, "[REDACTED:profanity]"))
+
+    spans.sort(key=lambda span: span[0])
+    parts: List[str] = []
+    cursor = 0
+    for start, end, replacement in spans:
+        parts.append(text[cursor:start])
+        parts.append(replacement)
+        cursor = end
+    parts.append(text[cursor:])
+    return "".join(parts)
+
+
 class Moderation(Guard):
     """
     Detects profanity and toxic language.
@@ -80,6 +104,15 @@ class Moderation(Guard):
         all_words = _BUILTIN_WORDS + (custom_words or [])
         self._profanity_re = _build_profanity_pattern(all_words)
 
+    def run(self, text: str, phase: GuardPhase) -> GuardResult:
+        result = super().run(text, phase)
+        if result.transformed_text is None or not self._max_scan_length:
+            return result
+        suffix = text[self._max_scan_length :]
+        if not suffix:
+            return result
+        return replace(result, transformed_text=result.transformed_text + suffix)
+
     def evaluate(self, text: str) -> GuardResult:
         profanity_matches = self._profanity_re.findall(text)
         toxicity_hits = any(pat.search(text) for pat in _TOXICITY_PATTERNS)
@@ -98,8 +131,7 @@ class Moderation(Guard):
 
         transformed: Optional[str] = None
         if self._action.value == "redact":
-            redacted = self._profanity_re.sub("[REDACTED:profanity]", text)
-            transformed = _TOXICITY_RE.sub("[REDACTED:toxicity]", redacted)
+            transformed = _redact_spans(text, self._profanity_re)
 
         return GuardResult(
             action=self._action,

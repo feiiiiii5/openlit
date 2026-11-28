@@ -96,6 +96,24 @@ describe('Pipeline', () => {
     expect(result.transformedText).toContain('[REDACTED:ssn]');
   });
 
+  it('redacts toxicity in TypeScript moderation', () => {
+    const result = new Moderation({ action: 'redact' }).evaluate('kill yourself');
+    expect(result.transformedText).toBe('[REDACTED:toxicity]');
+  });
+
+  it('keeps toxicity priority when a custom word overlaps it', () => {
+    const result = new Moderation({ action: 'redact', customWords: ["I'll"] }).evaluate(
+      "I'll kill you",
+    );
+    expect(result.transformedText).toBe('[REDACTED:toxicity]');
+  });
+
+  it('preserves the unscanned suffix after toxicity redaction', () => {
+    const guard = new Moderation({ action: 'redact', maxScanLength: 20 });
+    const result = guard.run('kill yourself and more text', GuardPhase.PREFLIGHT);
+    expect(result.transformedText).toBe('[REDACTED:toxicity] and more text');
+  });
+
   it('fail-open on guard error', () => {
     const pipeline = new Pipeline({
       guards: [new ThrowingGuard()],
